@@ -163,6 +163,9 @@ func (srv *Server) handle(conn *conn) {
 
 			clientTag = string(tb)
 			srv.sendDataToTagClient(clientTag, data[tagLen+6:])
+
+		default:
+			conn.sendBadPacket()
 		}
 	}
 }
