@@ -55,10 +55,8 @@ func AddToLog(name string, info interface{}) {
 	fmt.Fprintln(f, date, info)
 }
 
-func GenResponse(b []byte, enc bool) ([]byte, error) {
-	if enc {
-		b = []byte(hex.EncodeToString(b))
-	}
+func GenResponse(b []byte) ([]byte, error) {
+	b = []byte(hex.EncodeToString(b))
 	var h, l uint8 = uint8(len(b) >> 8), uint8(len(b) & 0xff)
 	r := []byte{byte(h), byte(l)}
 	r = append(r, b...)

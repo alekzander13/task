@@ -2,6 +2,7 @@ package main
 
 import (
 	"encoding/hex"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"log"
@@ -33,6 +34,8 @@ func (srv *Server) ListenAndServe() {
 
 	go srv.loop()
 
+	go srv.loopChkMsg()
+
 	for {
 		newConn, err := listen.Accept()
 		if err != nil {
@@ -52,12 +55,49 @@ func (srv *Server) ListenAndServe() {
 	}
 }
 
+func (srv *Server) loopChkMsg() {
+	defer srv.mu.Unlock()
+	for {
+		srv.mu.Lock()
+		for c := range srv.conns {
+			for k, v := range c.Messages {
+				switch v.Type {
+				case "connect":
+					delete(c.Messages, k)
+				case "broadcast":
+					v.Count++
+					if v.Count >= 3 {
+						delete(c.Messages, k)
+					} else {
+						c.Write(v.Text)
+						c.Messages[k] = v
+					}
+				case "forward":
+					v.Count++
+					if v.Count >= 3 {
+						delete(c.Messages, k)
+					} else {
+						c.Write(v.Text)
+						c.Messages[k] = v
+					}
+				}
+			}
+		}
+		srv.mu.Unlock()
+		time.Sleep(30 * time.Second)
+	}
+}
+
 func (srv *Server) loop() {
 	defer srv.mu.Unlock()
 	for {
 		srv.mu.Lock()
 		for c := range srv.conns {
-			c.sendGoodPacket()
+			var msg messageText
+			msg.Type = "broadcast"
+			msg.TagClient = c.Tag
+			msg.Text = "ok"
+			c.sendPacket(msg)
 		}
 		srv.mu.Unlock()
 		time.Sleep(120 * time.Second)
@@ -79,13 +119,18 @@ func (srv *Server) deleteConn(c *conn) {
 	delete(srv.conns, c)
 }
 
-func (srv *Server) sendDataToTagClient(tag string, data []byte) error {
+func (srv *Server) sendDataToTagClient(msg messageText) error {
 	defer srv.mu.Unlock()
 	srv.mu.Lock()
 	var count int
 	for c := range srv.conns {
-		if c.Tag == tag {
-			c.sendMessagePacket(data)
+		if c.Tag == msg.TagClient {
+			var newMsg messageText = msg
+			newMsg.TagClient = msg.TagSelf
+			newMsg.TagSelf = c.Tag
+			if err := c.sendPacket(newMsg); err != nil {
+				return err
+			}
 			count++
 		}
 	}
@@ -107,7 +152,7 @@ func (srv *Server) handle(conn *conn) {
 	for {
 		_, err := conn.Read(input)
 		if err != nil {
-			fmt.Println(err)
+			log.Println(err)
 			break
 		}
 
@@ -117,52 +162,41 @@ func (srv *Server) handle(conn *conn) {
 			continue
 		}
 
-		var data []byte
+		var ts string
 		for i := 0; i < int(lenData); i++ {
-			data = append(data, input[i+2])
+			ts += string(input[i+2])
 		}
 
-		switch string(data[:4]) {
-		case "aa01": //client intro
-			for i := 4; i < len(data); i++ {
-				if uint8(data[i]) > 0 {
-					conn.Tag += string(data[i])
-				}
-			}
+		mbody, err := hex.DecodeString(ts)
+		if err != nil {
+			conn.sendBadPacket()
+			continue
+		}
 
-			tb, err := hex.DecodeString(conn.Tag)
-			if err != nil {
-				conn.sendBadPacket()
-				break
-			}
-			conn.Tag = string(tb)
-			if err := conn.sendGoodPacket(); err != nil {
+		var msg messageText
+		if err := json.Unmarshal(mbody, &msg); err != nil {
+			conn.sendBadPacket()
+			continue
+		}
+
+		switch msg.Type {
+		case "connect":
+			conn.Tag = msg.TagSelf
+			msg.Text = "ok"
+			if err := conn.sendPacket(msg); err != nil {
 				fmt.Println(err)
 			}
-
-		case "aa02": //Forwardin message
-			var clientTag string
-			tagLen, err := strconv.ParseInt(hex.EncodeToString(data[4:6]), 16, 64)
-			if err != nil {
-				conn.sendBadPacket()
-				break
+		case "broadcast":
+			delete(conn.Messages, msg.MsgID)
+		case "forward":
+			if msg.Text == "ok" {
+				delete(conn.Messages, msg.MsgID)
 			}
-
-			for i := 6; i < int(tagLen)+6; i++ {
-				if uint8(data[i]) > 0 {
-					clientTag += string(data[i])
-				}
+			if msg.TagClient != "" {
+				srv.sendDataToTagClient(msg)
 			}
-
-			tb, err := hex.DecodeString(clientTag)
-			if err != nil {
-				fmt.Println(err)
-				conn.sendBadPacket()
-				break
-			}
-
-			clientTag = string(tb)
-			srv.sendDataToTagClient(clientTag, data[tagLen+6:])
+		case "error":
+			log.Printf("Error from %s text: %s", msg.TagSelf, msg.Error)
 
 		default:
 			conn.sendBadPacket()

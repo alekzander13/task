@@ -1,6 +1,7 @@
 package main
 
 import (
+	"encoding/json"
 	"net"
 	"time"
 )
@@ -8,9 +9,12 @@ import (
 type conn struct {
 	net.Conn
 
+	MsgID int64
+
 	IdleTimeout   time.Duration
 	MaxReadBuffer int64
 	Tag           string
+	Messages      map[int64]message
 }
 
 func (c *conn) Close() (err error) {
@@ -24,32 +28,32 @@ func (c *conn) updateDeadline() {
 }
 
 func (c *conn) sendBadPacket() {
-	r, err := GenResponse([]byte("bad"), true)
+	r, err := GenResponse([]byte(`{"error":"bad request"}`))
 	if err != nil {
 		return
 	}
 	c.Conn.Write(r)
 }
 
-func (c *conn) sendGoodPacket() error {
-	r, err := GenResponse([]byte("ok"), true)
-	if err != nil {
-		return err
-	}
-	_, err = c.Conn.Write(r)
-	if err == nil {
-		c.updateDeadline()
-	}
-	return err
-}
+func (c *conn) sendPacket(msg messageText) error {
+	c.MsgID++
+	msg.MsgID = c.MsgID
 
-func (c *conn) sendMessagePacket(m []byte) error {
-	r, err := GenResponse(m, false)
+	b, err := json.Marshal(msg)
 	if err != nil {
 		return err
 	}
+	r, err := GenResponse(b)
+	if err != nil {
+		return err
+	}
+
 	_, err = c.Conn.Write(r)
 	if err == nil {
+		if len(c.Messages) == 0 {
+			c.Messages = make(map[int64]message)
+		}
+		c.Messages[msg.MsgID] = message{Text: r, Type: msg.Type, Count: 0}
 		c.updateDeadline()
 	}
 	return err

@@ -2,6 +2,8 @@ package main
 
 import (
 	"encoding/hex"
+	"encoding/json"
+	"errors"
 	"fmt"
 	"log"
 	"net"
@@ -9,12 +11,70 @@ import (
 	"time"
 )
 
-func main() {
-	for i := 2; i < 11; i++ {
-		go startClient(fmt.Sprintf("client %d", i), false, "")
+type messageText struct {
+	MsgID     int64  `json:"msgID"`
+	Type      string `json:"type,omitempty"`
+	TagSelf   string `json:"tag,omitempty"`
+	TagClient string `json:"tagClient,omitempty"`
+	Text      string `json:"text,omitempty"`
+	Error     string `json:"error,omitempty"`
+}
+
+func makeResp(msg messageText) (b []byte, err error) {
+	b, err = json.Marshal(msg)
+	if err != nil {
+		return
 	}
 
-	startClient("client 1", true, "client 2")
+	b, err = GenResponse(b)
+	if err != nil {
+		return
+	}
+	return
+}
+
+func GenResponse(b []byte) ([]byte, error) {
+	b = []byte(hex.EncodeToString(b))
+	var h, l uint8 = uint8(len(b) >> 8), uint8(len(b) & 0xff)
+	r := []byte{byte(h), byte(l)}
+	r = append(r, b...)
+	return r, nil
+}
+
+func sendHello(c net.Conn, tagName string) error {
+	var msg messageText
+
+	msg.Type = "connect"
+	msg.TagSelf = tagName
+
+	return sendToServer(c, msg)
+}
+
+func sendError(c net.Conn, tagName string, errS string) error {
+	var msg messageText
+
+	msg.Type = "error"
+	msg.TagSelf = tagName
+	msg.Error = errS
+
+	return sendToServer(c, msg)
+}
+
+func sendOk(c net.Conn, msg messageText) error {
+	msg.Text = "ok"
+	return sendToServer(c, msg)
+}
+
+func sendToServer(c net.Conn, msg messageText) error {
+	r, err := makeResp(msg)
+	if err != nil {
+		return err
+	}
+
+	if n, err := c.Write(r); n == 0 || err != nil {
+		return errors.New("error send error")
+	}
+	return nil
 }
 
 func startClient(tagName string, sendMsg bool, tagClient string) {
@@ -25,91 +85,80 @@ func startClient(tagName string, sendMsg bool, tagClient string) {
 	}
 	defer conn.Close()
 
-	str := "aa01" + hex.EncodeToString([]byte(tagName))
-
-	b, err := GenResponse([]byte(str), false)
-	if err != nil {
-		return
-	}
-
-	log.Println(tagName, "write", b)
-	if n, err := conn.Write(b); n == 0 || err != nil {
-		return
+	if err := sendHello(conn, tagName); err != nil {
+		log.Printf("error connect: %v\n", err)
 	}
 
 	input := make([]byte, 1024)
 	for {
-		lenR, err := conn.Read(input)
+		_, err := conn.Read(input)
 		if err != nil {
-			log.Println(tagName, err)
+			log.Printf("error read '%s': %v\n", tagName, err)
 			return
 		}
-
-		log.Println(tagName, "Read", input[:lenR])
 
 		lenData, err := strconv.ParseInt(hex.EncodeToString(input[:2]), 16, 64)
 		if err != nil {
-			log.Println(tagName, err)
-			return
+			sendError(conn, tagName, err.Error())
+			continue
 		}
 
-		var data []byte
+		var ts string
 		for i := 0; i < int(lenData); i++ {
-			data = append(data, input[i+2])
+			ts += string(input[i+2])
 		}
 
-		if lenData > 3 {
+		mbody, err := hex.DecodeString(ts)
+		if err != nil {
+			sendError(conn, tagName, err.Error())
+			continue
+		}
 
-		} else {
-			var res string
-			for i := 0; i < len(data); i++ {
-				res += string(data[i])
-			}
-
-			tb, err := hex.DecodeString(res)
-			if err != nil {
-				return
-			}
-
-			if string(tb) == "bad" {
-				return
-			}
+		var msg messageText
+		if err := json.Unmarshal(mbody, &msg); err != nil {
+			sendError(conn, tagName, err.Error())
+			continue
 		}
 
 		conn.SetDeadline(time.Now().Add(180 * time.Second))
 
-		if sendMsg {
-			bClientTag, err := GenResponse([]byte(tagClient), true)
-			if err != nil {
-				return
-			}
-
-			bTagName, err := GenResponse([]byte(tagName), true)
-			if err != nil {
-				return
-			}
-
-			msg := "aa02" + string(bClientTag) + string(bTagName) + hex.EncodeToString([]byte("sended msg"))
-
-			b, err := GenResponse([]byte(msg), false)
-			if err != nil {
-				return
-			}
-
-			log.Println(tagName, "write", b)
-			if n, err := conn.Write(b); n == 0 || err != nil {
-				return
-			}
+		if msg.Error != "" {
+			log.Printf("error client '%s': %v\n", tagName, err)
+			return
 		}
+
+		if msg.Type == "broadcast" {
+			sendOk(conn, msg)
+			continue
+		}
+
+		if msg.Type == "forward" {
+			log.Printf("'%s' 'read forwarding msg': %v\n", tagName, msg)
+			if msg.Text == "ok" {
+				msg.TagClient = ""
+				msg.TagSelf = tagName
+
+			}
+			sendOk(conn, msg)
+			continue
+		}
+
+		if sendMsg {
+			var newMsg messageText
+			newMsg.TagSelf = tagName
+			newMsg.TagClient = tagClient
+			newMsg.Type = "forward"
+			newMsg.Text = "send message"
+			sendToServer(conn, newMsg)
+		}
+
 	}
 }
 
-func GenResponse(b []byte, enc bool) ([]byte, error) {
-	if enc {
-		b = []byte(hex.EncodeToString(b))
+func main() {
+	for i := 2; i < 11; i++ {
+		go startClient(fmt.Sprintf("client %d", i), false, "")
 	}
-	var h, l uint8 = uint8(len(b) >> 8), uint8(len(b) & 0xff)
-	r := []byte{byte(h), byte(l)}
-	r = append(r, b...)
-	return r, nil
+
+	startClient("client 1", true, "client 2")
 }
